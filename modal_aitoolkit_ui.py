@@ -16,28 +16,34 @@ image = (
         "libxext6"
     )
     .run_commands(
+        # Install Node.js 20
         "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
         "apt-get install -y nodejs",
+        # Clone AI Toolkit
         "cd /root && git clone https://github.com/ostris/ai-toolkit.git",
         "cd /root/ai-toolkit && git submodule update --init --recursive",
     )
     .pip_install(
-        "torch==2.8.0+cu128",
+        "torch==2.8.0",
         "torchvision==0.23.0+cu128",
         index_url="https://download.pytorch.org/whl/cu128"
     )
     .run_commands(
         # Install Python dependencies
         "cd /root/ai-toolkit && pip install -r requirements.txt",
-        # Build UI (npm install + build di folder ui)
-        "cd /root/ai-toolkit/ui && npm install",
+        # Install UI dependencies dan build SEKALI saja saat build image
+        "cd /root/ai-toolkit/ui && npm install --legacy-peer-deps",
+        # Setup Prisma database
+        "cd /root/ai-toolkit/ui && npx prisma generate",
+        "cd /root/ai-toolkit/ui && npx prisma db push",
+        # Build UI
         "cd /root/ai-toolkit/ui && npm run build",
     )
 )
 
 app = modal.App("ai-toolkit-ui")
 
-# Volumes untuk persist data - mount ke path kosong
+# Volumes untuk persist data
 volumes = {
     "/mnt/output": modal.Volume.from_name(
         "aitoolkit-output", 
@@ -52,83 +58,85 @@ volumes = {
 @app.function(
     image=image,
     gpu="L40S",  # Minimal 24GB VRAM untuk FLUX training
-    timeout=86400,  # 24 jam
-    volumes=volumes
+    timeout=3600,  # 24 jam
+    volumes=volumes,
+    allow_concurrent_inputs=100,
 )
-@modal.concurrent(max_inputs=10)
-@modal.web_server(8675, startup_timeout=180)
+@modal.web_server(8675, startup_timeout=300)
 def ui_server():
     """
-    Jalankan AI Toolkit UI di port 8675
+    Jalankan AI Toolkit Next.js UI (dengan API routes built-in)
     """
     import subprocess
     import os
     
-    # Buat symlink dari volume mount ke lokasi yang diharapkan AI Toolkit
-    os.makedirs("/root/ai-toolkit/output", exist_ok=True)
-    os.makedirs("/root/.cache", exist_ok=True)
+    # Setup symlinks untuk volumes
+    subprocess.run(["rm", "-rf", "/root/ai-toolkit/output"], check=False)
+    subprocess.run(["rm", "-rf", "/root/.cache"], check=False)
+    subprocess.run(["ln", "-sf", "/mnt/output", "/root/ai-toolkit/output"], check=True)
+    subprocess.run(["ln", "-sf", "/mnt/cache", "/root/.cache"], check=True)
     
-    # Symlink volume mounts
-    subprocess.run(["ln", "-sf", "/mnt/output", "/root/ai-toolkit/output"], check=False)
-    subprocess.run(["ln", "-sf", "/mnt/cache", "/root/.cache"], check=False)
+    # Buat directories yang diperlukan
+    os.makedirs("/mnt/output/datasets", exist_ok=True)
+    os.makedirs("/mnt/output/jobs", exist_ok=True)
+    os.makedirs("/mnt/output/models", exist_ok=True)
+    os.makedirs("/mnt/cache", exist_ok=True)
     
-    # Set working directory ke folder ui
-    os.chdir("/root/ai-toolkit/ui")
+    # Set permissions
+    subprocess.run(["chmod", "-R", "777", "/mnt/output"], check=False)
+    subprocess.run(["chmod", "-R", "777", "/mnt/cache"], check=False)
+    
+    # Setup Prisma database symlink (database juga harus persist)
+    db_dir = "/mnt/output/database"
+    os.makedirs(db_dir, exist_ok=True)
+    subprocess.run(["rm", "-rf", "/root/ai-toolkit/ui/prisma/dev.db"], check=False)
+    subprocess.run(["rm", "-rf", "/root/ai-toolkit/ui/prisma/dev.db-journal"], check=False)
+    
+    # Jika database belum ada, inisialisasi
+    if not os.path.exists(f"{db_dir}/dev.db"):
+        print("Initializing database...")
+        subprocess.run([
+            "npx", "prisma", "db", "push"
+        ], cwd="/root/ai-toolkit/ui", env=os.environ, check=False)
+        # Copy ke volume
+        subprocess.run([
+            "cp", "/root/ai-toolkit/ui/prisma/dev.db", f"{db_dir}/dev.db"
+        ], check=False)
+    
+    # Link database dari volume
+    subprocess.run([
+        "ln", "-sf", f"{db_dir}/dev.db", "/root/ai-toolkit/ui/prisma/dev.db"
+    ], check=True)
     
     # Set environment variables
     env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["NODE_ENV"] = "production"
+    env["OUTPUT_DIR"] = "/root/ai-toolkit/output"
+    env["PYTHONPATH"] = "/root/ai-toolkit"
+    env["PORT"] = "8675"
+    env["DATABASE_URL"] = "file:./prisma/dev.db"
     
     # Optional: Set auth token untuk keamanan
     # Uncomment baris ini dan ganti dengan password yang kuat
     # env["AI_TOOLKIT_AUTH"] = "your_secure_password_here"
     
-    # Start UI server
-    # Karena sudah di build, gunakan npm run start
+    print("=" * 70)
+    print("Starting AI Toolkit UI...")
+    print("Output directory:", env["OUTPUT_DIR"])
+    print("Database:", env["DATABASE_URL"])
+    print("UI will be available on port 8675")
+    print("=" * 70)
+    
+    # Change to UI directory dan jalankan 'npm run start'
+    # Next.js akan handle API routes secara otomatis
+    os.chdir("/root/ai-toolkit/ui")
+    
     subprocess.Popen(
         ["npm", "run", "start"],
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        cwd="/root/ai-toolkit/ui",
     )
-
-
-# Helper function untuk upload files
-@app.function(
-    image=image,
-    volumes=volumes,
-    timeout=3600,
-)
-def upload_files(local_path: str, remote_path: str):
-    """
-    Upload dataset atau files ke volume
-    
-    Usage:
-    modal run modal_aitoolkit_ui.py::upload_files \
-      --local-path ./my_images \
-      --remote-path dataset/my_project
-    """
-    import shutil
-    from pathlib import Path
-    
-    src = Path(local_path)
-    dst = Path(f"/mnt/output/{remote_path}")
-    
-    if not src.exists():
-        raise FileNotFoundError(f"Local path tidak ditemukan: {local_path}")
-    
-    if src.is_dir():
-        dst.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-        print(f"✓ Uploaded directory: {local_path} -> {dst}")
-        
-        # Hitung jumlah files
-        file_count = len(list(dst.rglob("*.*")))
-        print(f"  Total files: {file_count}")
-    else:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        print(f"✓ Uploaded file: {local_path} -> {dst}")
-
 
 # Helper function untuk download results
 @app.function(
@@ -163,42 +171,46 @@ def download_files(remote_path: str, local_path: str):
         shutil.copy2(src, dst)
         print(f"✓ Downloaded file: {src} -> {local_path}")
 
-
-# Function untuk list files di volume
+# Function untuk check dan setup directories
 @app.function(
     image=image,
     volumes=volumes,
 )
-def list_files(path: str = ""):
+def setup_directories():
     """
-    List files di output volume
+    Setup dan verify directory structure
     
     Usage:
-    modal run modal_aitoolkit_ui.py::list_files --path dataset
+    modal run modal_aitoolkit_ui.py::setup_directories
     """
+    import os
     from pathlib import Path
     
-    base = Path(f"/mnt/output/{path}")
+    directories = [
+        "/mnt/output/datasets",
+        "/mnt/output/jobs", 
+        "/mnt/output/models",
+        "/mnt/cache"
+    ]
     
-    if not base.exists():
-        print(f"Path tidak ditemukan: {path}")
-        return
-    
-    print(f"\n📁 Files di: output/{path}\n")
+    print("\n🔧 Setting up directories...\n")
     print("-" * 70)
     
-    if base.is_file():
-        size = base.stat().st_size / (1024 * 1024)  # MB
-        print(f"  {base.name} ({size:.2f} MB)")
-    else:
-        for item in sorted(base.rglob("*")):
-            if item.is_file():
-                rel_path = item.relative_to(base)
-                size = item.stat().st_size / (1024 * 1024)  # MB
-                print(f"  {rel_path} ({size:.2f} MB)")
+    for dir_path in directories:
+        path = Path(dir_path)
+        path.mkdir(parents=True, exist_ok=True)
+        
+        # Set permissions
+        os.chmod(dir_path, 0o777)
+        
+        # Verify
+        if path.exists():
+            print(f"✓ {dir_path} - OK")
+        else:
+            print(f"✗ {dir_path} - FAILED")
     
     print("-" * 70)
-
+    print("✓ Directory setup complete!\n")
 
 @app.local_entrypoint()
 def main():
@@ -210,41 +222,42 @@ def main():
     print("="*70)
     
     print("\n📦 GPU & Resources:")
-    print("  - GPU: A10G (24GB VRAM)")
-    print("  - UI Port: 8675")
-    print("  - Timeout: 24 hours")
+    print("  - GPU: L40S (48GB VRAM)")
+    print("  - Port: 8675 (UI + API)")
+    print("  - Timeout: 1 hours")
     print("  - Volumes: aitoolkit-output, aitoolkit-cache")
     
     print("\n🔧 Deployment Commands:")
     print("  Deploy:    modal deploy modal_aitoolkit_ui.py")
     print("  Dev mode:  modal serve modal_aitoolkit_ui.py")
     
-    print("\n📤 Upload Dataset:")
-    print("  modal run modal_aitoolkit_ui.py::upload_files \\")
-    print("    --local-path ./my_images \\")
-    print("    --remote-path dataset/project1")
-    
     print("\n📥 Download Results:")
     print("  modal run modal_aitoolkit_ui.py::download_files \\")
     print("    --remote-path my_lora/checkpoint.safetensors \\")
     print("    --local-path ./my_lora.safetensors")
     
-    print("\n📋 List Files:")
-    print("  modal run modal_aitoolkit_ui.py::list_files --path dataset")
+    print("\n🔧 Setup Directories (jalankan setelah deploy):")
+    print("  modal run modal_aitoolkit_ui.py::setup_directories")
     
     print("\n🔐 Security Setup (Recommended):")
     print("  Uncomment AI_TOOLKIT_AUTH di fungsi ui_server() untuk set password")
     print("  env['AI_TOOLKIT_AUTH'] = 'your_secure_password'")
     
     print("\n💡 Important Notes:")
+    print("  - UI sudah di-build saat create image (no runtime rebuild)")
+    print("  - npm run start = production server tanpa rebuild")
     print("  - FLUX training membutuhkan minimal 24GB VRAM")
-    print("  - Training jobs berjalan di background (UI bisa ditutup)")
+    print("  - Training jobs berjalan di background")
     print("  - Semua output tersimpan di Modal Volume")
-    print("  - Untuk Hugging Face models, set HF_TOKEN via Modal secrets:")
-    print("    modal secret create huggingface HF_TOKEN=your_token")
+    
+    print("\n🔑 Hugging Face Setup (Optional):")
+    print("  Untuk FLUX.1-dev, set HF token sebagai Modal secret:")
+    print("  modal secret create huggingface HF_TOKEN=your_token")
     
     print("\n🌐 Access URL:")
     print("  Setelah deploy, Modal akan memberikan URL seperti:")
     print("  https://username--ai-toolkit-ui-ui-server.modal.run")
+    
+    print("\n" + "="*70 + "\n")
     
     print("\n" + "="*70 + "\n")
